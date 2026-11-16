@@ -1,0 +1,84 @@
+name: Release
+
+# Push a tag like v1.2.3 to test, build, sign, notarize and publish a DMG and an updater zip on GitHub Releases.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ github.ref_name }}
+      # Signing is skipped (ad-hoc build) when the certificate secret is not configured.
+      SIGNED: ${{ secrets.APPLE_CERTIFICATE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: ./scripts/test.sh
+
+      - name: Import Developer ID certificate
+        if: env.SIGNED == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "SIGN_IDENTITY=${APPLE_SIGNING_IDENTITY:-Developer ID Application}" >> "$GITHUB_ENV"
+
+      - name: Build app
+        run: |
+          VERSION="${VERSION#v}" BUILD_NUMBER="${{ github.run_number }}" UNIVERSAL=1 ./scripts/build-app.sh
+
+      # The app is notarized and stapled first, so the zip used by the in-app updater
+      # and the DMG both contain an app that opens without contacting Apple.
+      - name: Notarize and staple app
+        if: env.SIGNED == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent dist/Hoopoe.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple dist/Hoopoe.app
+
+      - name: Package zip and DMG
+        run: ./scripts/package.sh
+
+      - name: Notarize and staple DMG
+        if: env.SIGNED == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          dmg="dist/Hoopoe-${VERSION#v}.dmg"
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$dmg"
+
+      - name: Warn about unsigned build
+        if: env.SIGNED != 'true'
+        run: echo "::warning::Signing secrets are not set. This release is ad-hoc signed and not notarized."
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$VERSION" dist/*.dmg dist/*.zip --title "Hoopoe ${VERSION#v}" --generate-notes
